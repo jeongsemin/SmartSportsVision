@@ -9,7 +9,7 @@ from color_distinguish import ColorDistinguish
 # track_id : 팀 저장
 player_team = {}
 # YOLO 모델 로드
-model = YOLO("yolo11s.pt")
+model = YOLO("yolo11x.pt")
 
 # 동영상 파일 경로
 video_path = ".\\Match_Video\\World Cup - 2022. Spain - Costa-Rica. Tactical cam.mp4"
@@ -59,7 +59,7 @@ class TeamColorTracker:
 
     color_helper = ColorDistinguish()
 
-    def __init__(self, sample_window=12, refresh_every=10, min_pixels=70, initial_team_colors=None):
+    def __init__(self, sample_window=12, refresh_every=10, min_pixels=70, initial_team_colors=None, debug=False):
         self.player_states = {}
         self.team_profiles = {}
         self.sample_window = sample_window
@@ -68,8 +68,12 @@ class TeamColorTracker:
         self.frame_idx = 0
         self.kmeans_refresh_every = 20
         self.team_split_threshold = 0.10
-        self.unknown_threshold = 0.14
+        # Raised threshold to allow more tolerant matching for team colors (e.g., faded/variant reds)
+        self.unknown_threshold = 0.36
+        # If distances to A/B are too close (< ambiguous_margin), treat as UNKNOWN
+        self.ambiguous_margin = 0.06
         self.initial_team_colors = initial_team_colors or {}
+        self.debug = debug
 
     def _normalize_lab(self, lab_color):
         return np.asarray(lab_color, dtype=np.float32) / 255.0
@@ -240,20 +244,31 @@ class TeamColorTracker:
             dist_a = self._lab_distance(state["rep_lab"], self.team_profiles["A"]["centroid_lab"])
             dist_b = self._lab_distance(state["rep_lab"], self.team_profiles["B"]["centroid_lab"])
 
-            label = self.color_helper.classify_lab_color(
-                state["rep_lab"],
-                team_a_lab=self.team_profiles["A"]["centroid_lab"],
-                team_b_lab=self.team_profiles["B"]["centroid_lab"],
-                unknown_threshold=self.unknown_threshold,
-            )
-            if label != "UNKNOWN":
-                return label
+            # debug print
+            if self.debug:
+                try:
+                    print(f"[DEBUG] id={track_id} rep_lab={state['rep_lab']} distA={dist_a:.3f} distB={dist_b:.3f}")
+                except Exception:
+                    pass
 
+            # If too far from both profiles -> UNKNOWN
             if min(dist_a, dist_b) > self.unknown_threshold:
                 return "UNKNOWN"
-            if dist_a < dist_b:
-                return "A"
-            return "B"
+
+            # If distances are too close (ambiguous), mark UNKNOWN
+            if abs(dist_a - dist_b) < self.ambiguous_margin:
+                # If team initial color exists, enforce family check to avoid mislabeling
+                if self.initial_team_colors:
+                    family = self.color_helper.detect_family(state['rep_lab'])
+                    # If family is neutral or doesn't match either initial team family, treat UNKNOWN
+                    fam_a = self.color_helper.detect_family(self.team_profiles['A']['centroid_lab']) if 'A' in self.team_profiles else None
+                    fam_b = self.color_helper.detect_family(self.team_profiles['B']['centroid_lab']) if 'B' in self.team_profiles else None
+                    if family is None or (family != fam_a and family != fam_b):
+                        return "UNKNOWN"
+                else:
+                    return "UNKNOWN"
+
+            return "A" if dist_a < dist_b else "B"
 
         return "UNKNOWN"
 
@@ -261,6 +276,19 @@ class TeamColorTracker:
         if team_label not in self.team_profiles:
             self.team_profiles[team_label] = {"centroid_lab": color_lab.copy(), "member_count": 1}
             return
+
+        # Prevent centroid drift: if user provided an initial color, skip updates for observations
+        # that are far from the user color (likely non-uniform artifacts).
+        if team_label in self.initial_team_colors and self.initial_team_colors[team_label] is not None:
+            user_color = np.asarray(self.initial_team_colors[team_label], dtype=np.float32)
+            dist_to_user = self._lab_distance(color_lab, user_color)
+            if dist_to_user > 0.30:
+                if self.debug:
+                    try:
+                        print(f"[DEBUG] skip centroid update for team {team_label}: dist_to_user={dist_to_user:.3f} > 0.30")
+                    except Exception:
+                        pass
+                return
 
         profile = self.team_profiles[team_label]
         alpha = 0.18 if profile["member_count"] < 4 else 0.10
@@ -298,7 +326,8 @@ player_colors = {}
 # 추적 ID별로 총 이동 거리를 저장할 딕셔너리
 total_distance = defaultdict(float)
 
-team_tracker = TeamColorTracker(sample_window=12, refresh_every=8, min_pixels=80, initial_team_colors=initial_team_colors)
+team_tracker = TeamColorTracker(sample_window=12, refresh_every=8, min_pixels=80, initial_team_colors=initial_team_colors, debug=True)
+DEBUG_MAX_FRAMES = 220
 
 
 while True:
@@ -362,6 +391,10 @@ while True:
     # 화면 출력
     cv2.imshow(window_name, annotated_frame)
 
+    # debug mode: optionally stop after a limited number of frames for log capture
+    if team_tracker.debug and team_tracker.frame_idx >= DEBUG_MAX_FRAMES:
+        print(f"[DEBUG] reached DEBUG_MAX_FRAMES={DEBUG_MAX_FRAMES}, stopping loop")
+        break
     # ESC키를 누르면 종료
     key = cv2.waitKey(10) & 0xFF
     if key == 27:  # ESC key

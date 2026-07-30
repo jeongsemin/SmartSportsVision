@@ -105,6 +105,25 @@ class ColorDistinguish:
         return "normal"
 
     @staticmethod
+    def detect_family(lab_color):
+        """Return a coarse family name for a LAB color: 'red','blue','green','neutral', or None."""
+        color = np.asarray(lab_color, dtype=np.float32)
+        a = float(color[1] - 0.5)
+        b = float(color[2] - 0.5)
+        chroma = float(np.sqrt(a * a + b * b))
+        luma = float(color[0])
+
+        if chroma < 0.04:
+            return "neutral"
+        if a > 0.12 and b > 0.05:
+            return "red"
+        if a > 0.12 and b < -0.10:
+            return "blue"
+        if a < -0.10 and b > 0.10:
+            return "green"
+        return None
+
+    @staticmethod
     def parse_color(value):
         if value is None:
             return None
