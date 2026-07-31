@@ -5,11 +5,12 @@ import math
 import numpy as np
 from sklearn.cluster import KMeans
 from color_distinguish import ColorDistinguish
+import supervision as sv
 
 # track_id : 팀 저장
 player_team = {}
 # YOLO 모델 로드
-model = YOLO("yolo11x.pt")
+model = YOLO("yolo11n.pt")
 
 # 동영상 파일 경로
 video_path = ".\\Match_Video\\World Cup - 2022. Spain - Costa-Rica. Tactical cam.mp4"
@@ -51,6 +52,8 @@ cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
 # 추적 ID별로 위치 기록을 저장할 딕셔너리
 track_history = defaultdict(list)
+ball_last_position = None
+ball_track_id = None
 total_distance = defaultdict(float)
 
 
@@ -343,10 +346,17 @@ while True:
     # classes=[0, 32]는 사람과 공만 감지하도록 설정
     # persist=True는 추적 결과를 유지하도록 설정
     # tracker="bytetrack.yaml"는 ByteTrack 추적기를 사용하도록 설정
-    results = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=[0], verbose=False)
+    results = model.track(frame, persist=True, tracker="bytetrack.yaml", classes=[0, 32], verbose=False)
 
     # 결과 그리기
     annotated_frame = frame.copy()
+    player_boxes = []
+    player_track_ids = []
+    player_teams = []
+    player_labels = []
+    ball_boxes = []
+    ball_track_ids = []
+    ball_labels = []
 
     for result in results:
         if result.boxes is None or result.boxes.id is None:
@@ -354,12 +364,21 @@ while True:
 
         boxes = result.boxes.xyxy
         ids = result.boxes.id.int().cpu().tolist()
+        classes = result.boxes.cls.int().cpu().tolist()
 
-        for box, track_id in zip(boxes, ids):
+        for box, track_id, class_id in zip(boxes, ids, classes):
             x1, y1, x2, y2 = map(int, box)
 
             cx = (x1 + x2) // 2
-            cy = y2
+            cy = (y1 + y2) // 2
+
+            if class_id == 32:
+                ball_boxes.append([x1, y1, x2, y2])
+                ball_track_ids.append(track_id)
+                ball_labels.append(f"BALL {track_id}")
+                ball_last_position = (cx, cy)
+                ball_track_id = track_id
+                continue
 
             track_history[track_id].append((cx, cy))
             if len(track_history[track_id]) > 100:
@@ -369,16 +388,10 @@ while True:
             player_team[track_id] = team
             player_colors[track_id] = rep_bgr
 
-            cv2.circle(annotated_frame, (cx, cy), 10, rep_bgr, 2)
-            cv2.putText(
-                annotated_frame,
-                f"ID: {track_id} TEAM:{team or 'UNKNOWN'}",
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                rep_bgr,
-                2,
-            )
+            player_boxes.append([x1, y1, x2, y2])
+            player_track_ids.append(track_id)
+            player_teams.append(team or "UNKNOWN")
+            player_labels.append(f"ID:{track_id} {team or 'UNKNOWN'}")
 
             points = track_history[track_id]
             if len(points) > 1:
@@ -387,6 +400,51 @@ while True:
                 distance = math.sqrt((curr_x - prev_x) ** 2 + (curr_y - prev_y) ** 2)
                 if distance > 2:
                     total_distance[track_id] += distance
+
+    box_annotator = sv.BoxAnnotator(color=sv.ColorPalette.DEFAULT, thickness=2, color_lookup=sv.ColorLookup.CLASS)
+    label_annotator = sv.LabelAnnotator(color=sv.ColorPalette.DEFAULT, text_color=sv.Color.from_hex("#000000"))
+
+    if player_boxes:
+        player_detections = sv.Detections(
+            xyxy=np.array(player_boxes, dtype=np.float32),
+            class_id=np.zeros(len(player_boxes), dtype=np.int32),
+            tracker_id=np.array(player_track_ids, dtype=np.int32),
+            data={"team": np.array(player_teams, dtype=object)},
+        )
+        annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=player_detections)
+        annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=player_detections, labels=player_labels)
+
+    if ball_boxes:
+        ball_detections = sv.Detections(
+            xyxy=np.array(ball_boxes, dtype=np.float32),
+            class_id=np.ones(len(ball_boxes), dtype=np.int32),
+            tracker_id=np.array(ball_track_ids, dtype=np.int32),
+            data={"kind": np.array(["ball"] * len(ball_boxes), dtype=object)},
+        )
+        annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=ball_detections)
+        annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=ball_detections, labels=ball_labels)
+
+    for track_id, points in list(track_history.items()):
+        if len(points) > 1:
+            trace_xy = np.array(points, dtype=np.float32)
+            if len(trace_xy) >= 2:
+                for j in range(1, len(trace_xy)):
+                    x1, y1 = map(int, trace_xy[j - 1])
+                    x2, y2 = map(int, trace_xy[j])
+                    cv2.line(annotated_frame, (x1, y1), (x2, y2), (255, 221, 87), 2)
+
+    if ball_last_position is not None:
+        cv2.circle(annotated_frame, ball_last_position, 6, (0, 0, 255), -1)
+        cv2.putText(
+            annotated_frame,
+            "BALL",
+            (ball_last_position[0] + 8, ball_last_position[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
     # 화면 출력
     cv2.imshow(window_name, annotated_frame)
